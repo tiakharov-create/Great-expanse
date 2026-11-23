@@ -152,10 +152,41 @@
   }
 
   /* ---------- запрос ---------- */
+  function apiUrls(base) {
+    var b = String(base || '').trim().replace(/\s+/g, '');
+    if (!b) return [];
+    if (/^http:\/\//i.test(b)) b = 'https://' + b.slice(7);
+    b = b.replace(/\/+$/, '');
+    var out = [];
+    function add(u) { if (u && out.indexOf(u) < 0) out.push(u); }
+    if (/\/chat\/completions$/i.test(b)) { add(b); return out; }
+    var m = b.match(/^(https?:\/\/[^\/]+)(\/.*)?$/);
+    if (!m) { add(b + '/chat/completions'); return out; }
+    var root = m[1], path = (m[2] || '').replace(/\/+$/, '');
+    add(root + path + '/chat/completions');
+    if (!path) add(root + '/v1/chat/completions');
+    else if (path === '/api') add(root + '/api/v1/chat/completions');
+    else if (/\/api$/.test(path)) add(root + '/api/v1/chat/completions');
+    else if (!/\/(v1|api\/v1)$/.test(path)) add(root + path + '/v1/chat/completions');
+    return out;
+  }
+
+  function httpError(status, text, url) {
+    var msg = 'HTTP ' + status, short = '';
+    try {
+      var j = JSON.parse(text);
+      if (j && j.error) {
+        short = (typeof j.error === 'string' ? j.error : (j.error.message || '')) +
+                (j.error.code ? ' (' + j.error.code + ')' : '');
+      } else short = JSON.stringify(j).slice(0, 160);
+    } catch (e) { short = String(text || '').replace(/\s+/g, ' ').slice(0, 160); }
+    if (short) msg += ': ' + short;
+    return new Error(msg + ' [' + String(url).replace(/^https?:\/\//, '') + ']');
+  }
+
   function fetchAI(msgs, ctrl) {
-    var base = String(CFG.url || '').replace(/\/+$/, '');
-    if (!base) throw new Error('не задан адрес');
-    var url = /\/chat\/completions$/i.test(base) ? base : base + '/chat/completions';
+    var urls = apiUrls(CFG.url);
+    if (!urls.length) throw new Error('не задан адрес');
     var body = {
       model: CFG.model,
       messages: msgs,
@@ -164,18 +195,33 @@
     };
     var ac = ctrl || ((typeof AbortController !== 'undefined') ? new AbortController() : null);
     var timer = ac ? setTimeout(function () { try { ac.abort(); } catch (e) {} }, 90000) : null;
-    return fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + CFG.key },
-      body: JSON.stringify(body),
-      signal: ac ? ac.signal : undefined
-    }).then(function (r) {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
-    }).then(function (d) {
-      var c = d && d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
-      if (typeof c !== 'string' || !c.trim()) throw new Error('пустой ответ');
-      return c;
+    function one(url) {
+      return fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + CFG.key },
+        body: JSON.stringify(body),
+        signal: ac ? ac.signal : undefined
+      }).then(function (r) {
+        if (!r.ok) {
+          return r.text().then(function (t) { throw httpError(r.status, t, url); },
+                               function () { throw httpError(r.status, '', url); });
+        }
+        return r.json().then(function (d) {
+          var c = d && d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
+          if (typeof c !== 'string' || !c.trim()) throw new Error('пустой ответ от ' + url.replace(/^https?:\/\//, ''));
+          return c;
+        });
+      });
+    }
+    var chain = Promise.reject(new Error('нет адреса'));
+    urls.forEach(function (u) { chain = chain.catch(function () { return one(u); }); });
+    return chain.catch(function (err) {
+      if (err && err.name === 'AbortError') throw err;
+      if (err && err.name === 'TypeError') {
+        throw new Error('сеть/CORS не пускает на ' + urls[0].replace(/^https?:\/\//, '') +
+          ': проверьте адрес и доступность роутера из браузера');
+      }
+      throw err;
     }).finally(function () { if (timer) clearTimeout(timer); });
   }
 
@@ -436,8 +482,11 @@
       CTX.busy = false; CTX.ctrl = null; setBusy(false);
     }).catch(function (err) {
       var wt = document.getElementById('aiWait'); if (wt && wt.parentNode) wt.parentNode.removeChild(wt);
-      addMsg('ai-sys', '<b>Ошибка:</b> ' + esc(err && err.message ? err.message : 'нет ответа') +
-        '. Чат открыт — можно написать ещё раз или вернуться к вариантам.');
+      if (!(err && err.name === 'AbortError')) {
+        addMsg('ai-sys', '<b>Ошибка:</b> ' + esc(err && err.message ? err.message : 'нет ответа') +
+          '. Проверьте адрес, ключ и модель в «Настройки → Ответы нейросети». ' +
+          'Чат открыт — можно написать ещё раз или вернуться к вариантам.');
+      }
       CTX.busy = false; CTX.ctrl = null; setBusy(false);
     });
   }
